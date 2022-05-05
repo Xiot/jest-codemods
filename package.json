@@ -29,7 +29,8 @@
     "verify": "yarn lint && yarn build && yarn test:cov",
     "verify:bail": "yarn lint:bail && yarn verify",
     "ci": "yarn verify:bail && codecov",
-    "prepare": "husky install"
+    "prepare": "husky install",
+    "transform:bolt": "tsc && node ./dist/scripts/bolt.js"
   },
   "lint-staged": {
     "*.js": [

@@ -706,6 +706,15 @@ export default function transformer(fileInfo, api, options) {
               )
             }
 
+            if (argType === j.StringLiteral.name) {
+              return createCall(
+                'toContain',
+                args,
+                updateExpect(value, (node) => node),
+                false
+              )
+            }
+
             return createCall(
               'toEqual',
               [
