@@ -513,8 +513,32 @@ export default function transformer(fileInfo, api, options) {
           case 'function':
             return typeOf(p, value, [j.literal('function')], containsNot)
           case 'called':
-            return createCall('toBeCalled', [], rest, containsNot)
+            // console.log('c', rest)
+            if (rest.type === 'CallExpression') {
+              return createCall('toHaveBeenCalled', [], rest, containsNot)
+            } else {
+              return j.binaryExpression(
+                '>',
+                j.memberExpression(
+                  j.memberExpression(
+                    j.memberExpression(rest, j.identifier('mock')),
+                    j.identifier('calls')
+                  ),
+                  j.identifier('length')
+                ),
+                j.literal(0)
+              )
+            }
+          case 'callcount':
+            return j.memberExpression(
+              j.memberExpression(
+                j.memberExpression(rest, j.identifier('mock')),
+                j.identifier('calls')
+              ),
+              j.identifier('length')
+            )
           case 'calledonce':
+            // console.log('\nCALLED ONCE\n', p)
             return createCall('toBeCalledTimes', [j.literal(1)], rest, containsNot)
           case 'calledtwice':
             return createCall('toBeCalledTimes', [j.literal(2)], rest, containsNot)
@@ -706,27 +730,11 @@ export default function transformer(fileInfo, api, options) {
               )
             }
 
-            if (argType === j.StringLiteral.name) {
-              return createCall(
-                'toContain',
-                args,
-                updateExpect(value, (node) => node),
-                false
-              )
-            }
-
             return createCall(
-              'toEqual',
-              [
-                createCallChain(
-                  containsNot
-                    ? ['expect', 'not', 'arrayContaining']
-                    : ['expect', 'arrayContaining'],
-                  [j.arrayExpression(args)]
-                ),
-              ],
+              'toContain',
+              args,
               updateExpect(value, (node) => node),
-              false
+              containsNot
             )
           }
           case 'containing':

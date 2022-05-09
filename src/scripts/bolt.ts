@@ -18,7 +18,10 @@ const flags = {
 }
 const parser = 'tsx'
 const transformers = ['sinon', 'chai-should', 'mocha']
-const transformerArgs = []
+// const transformers = ['sinon']
+const transformerArgs = [...process.argv.filter((a) => a.startsWith('--'))].filter(
+  Boolean
+)
 
 executeTransformations({
   files: filesExpanded,

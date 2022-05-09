@@ -1,4 +1,5 @@
-import core, { API, FileInfo } from 'jscodeshift'
+import core, { API, Collection, FileInfo } from 'jscodeshift'
+import * as recast from 'recast'
 
 import {
   chainContainsUtil,
@@ -7,7 +8,7 @@ import {
   isExpectCallUtil,
 } from '../utils/chai-chain-utils'
 import finale from '../utils/finale'
-import { removeDefaultImport } from '../utils/imports'
+import { findImports, removeDefaultImport } from '../utils/imports'
 import { findParentOfType } from '../utils/recast-helpers'
 import {
   expressionContainsProperty,
@@ -16,6 +17,7 @@ import {
   isExpectSinonObject,
   modifyVariableDeclaration,
 } from '../utils/sinon-helpers'
+import { transformSandbox } from './bolt/sinon-sandbox'
 
 const SINON_CALL_COUNT_METHODS = [
   'called',
@@ -30,8 +32,8 @@ const CHAI_CHAIN_MATCHERS = new Set(
     a.toLowerCase()
   )
 )
-const SINON_CALLED_WITH_METHODS = ['calledWith', 'notCalledWith']
-const SINON_SPY_METHODS = ['spy', 'stub']
+const SINON_CALLED_WITH_METHODS = ['calledWith', 'notCalledWith', 'calledOnceWith']
+const SINON_SPY_METHODS = ['spy', 'stub', 'replaceGetter', 'replace', 'fake']
 const SINON_MOCK_RESETS = {
   reset: 'mockReset',
   restore: 'mockRestore',
@@ -52,6 +54,58 @@ const SINON_MATCHERS_WITH_ARGS = {
 }
 const SINON_NTH_CALLS = new Set(['firstCall', 'secondCall', 'thirdCall', 'lastCall'])
 const EXPECT_PREFIXES = new Set(['to'])
+
+const MOCK_METHODS = [
+  { source: 'resolves', target: 'mockResolvedValue' },
+  { source: 'rejects', target: 'mockRejectedValue' },
+  { source: 'callsFake', target: 'mockImplementation' },
+]
+
+function debug(node: core.ASTNode) {
+  return recast.print(node).code
+}
+
+function transformResolves(j: core.JSCodeshift, ast: Collection<any>) {
+  ast
+    .find(j.CallExpression, {
+      callee: {
+        type: 'MemberExpression',
+        property: {
+          type: 'Identifier',
+          name: (name) => MOCK_METHODS.some((x) => x.source === name),
+        },
+      },
+    })
+    .replaceWith((node) => {
+      const { value } = node
+      // @ts-expect-error - property.name will be there
+      const methodName = value.callee.property.name ?? ''
+      const replacement = MOCK_METHODS.find((x) => x.source === methodName)?.target
+      if (!replacement) {
+        return node.node
+      }
+
+      // eslint-disable-next-line prefer-destructuring
+      const callee: core.MemberExpression = value.callee as any
+      return j.callExpression(
+        j.memberExpression(callee.object, j.identifier(replacement)),
+        value.arguments
+      )
+    })
+}
+
+function transformExpectToBeCalled(j: core.JSCodeshift, ast: Collection<any>) {
+  const chainContains = chainContainsUtil(j)
+  const getAllBefore = getNodeBeforeMemberExpressionUtil(j)
+  const createCall = createCallUtil(j)
+
+  ast.find(j.CallExpression, {
+    callee: {
+      type: 'Identifier',
+      name: 'expect',
+    },
+  })
+}
 
 /* 
   expect(spy.called).to.be(true) -> expect(spy).toHaveBeenCalled()
@@ -76,8 +130,8 @@ function transformCallCountAssertions(j, ast) {
     })
     .replaceWith((np) => {
       const { node } = np
+      console.log('call-count', debug(node))
       const expectArg = getExpectArg(node.callee)
-
       // remove .called/.callCount/etc prop from expect argument
       // eg: expect(Api.get.callCount) -> expect(Api.get)
       j(np)
@@ -174,16 +228,53 @@ function transformCalledWithAssertions(j, ast) {
           return createCall('toHaveBeenCalledWith', expectArg.arguments, rest, negated)
         case 'notCalledWith':
           return createCall('toHaveBeenCalledWith', expectArg.arguments, rest, !negated)
+        case 'calledOnceWith':
+          return createCall('toHaveBeenCalledWith', expectArg.arguments, rest, negated)
         default:
           return node
       }
     })
 }
 
+function transformAssertCalled(j: core.JSCodeshift, ast: Collection<any>) {
+  ast
+    .find(j.CallExpression, {
+      callee: {
+        type: 'MemberExpression',
+        property: {
+          type: 'Identifier',
+          name: 'called',
+        },
+        object: {
+          type: 'MemberExpression',
+          object: {
+            type: 'Identifier',
+            name: 'sinon',
+          },
+          property: {
+            type: 'Identifier',
+            name: 'assert',
+          },
+        },
+      },
+    })
+    .replaceWith((path) => {
+      const expectCall = j.callExpression(j.identifier('expect'), path.value.arguments)
+      const haveBeenCalled = j.memberExpression(
+        expectCall,
+        j.identifier('toHaveBeenCalled')
+      )
+      return j.callExpression(haveBeenCalled, [])
+    })
+}
+
 /* 
 sinon.stub(Api, 'get') -> jest.spyOn(Api, 'get')
 */
-function transformStub(j: core.JSCodeshift, ast, sinonExpression) {
+function transformStub(j: core.JSCodeshift, ast, sinonName: string) {
+  // console.log('exp', sinonExpression.get('name')
+
+  if (!sinonName) return
   ast
     .find(j.CallExpression, {
       callee: {
@@ -194,19 +285,24 @@ function transformStub(j: core.JSCodeshift, ast, sinonExpression) {
         },
         object: {
           type: 'Identifier',
-          name: sinonExpression,
+          name: sinonName,
         },
       },
     })
     .replaceWith((np) => {
       const args = np.value.arguments
-
       // stubbing/spyOn module
       if (args.length >= 2) {
-        let spyOn = j.callExpression(
-          j.memberExpression(j.identifier('jest'), j.identifier('spyOn')),
-          args.slice(0, 2)
-        )
+        const isReplaceGetter = np.value.callee.property.name === 'replaceGetter'
+
+        let spyOn = j.callExpression.from({
+          callee: j.memberExpression(j.identifier('jest'), j.identifier('spyOn')),
+          arguments: isReplaceGetter
+            ? [...args.slice(0, 2), j.literal('get')]
+            : args.slice(0, 2),
+          // TODO: Convert Type Parameters
+          // typeArguments: j.typeParameterInstantiation(np.value.typeParameters.params), //np.value.typeParameters,
+        })
 
         // add mockClear since jest doesn't reset the stub on re-declaration like sinon does
         spyOn = j.callExpression(j.memberExpression(spyOn, j.identifier('mockClear')), [])
@@ -216,6 +312,12 @@ function transformStub(j: core.JSCodeshift, ast, sinonExpression) {
           spyOn = j.callExpression(
             j.memberExpression(spyOn, j.identifier('mockImplementation')),
             [args[2]]
+          )
+        } else if (np.parentPath.value.type !== 'MemberExpression') {
+          // Adds a default implementation that returns undefined.
+          spyOn = j.callExpression(
+            j.memberExpression(spyOn, j.identifier('mockImplementation')),
+            [j.arrowFunctionExpression([], j.identifier('undefined'))]
           )
         }
 
@@ -479,9 +581,14 @@ function transformMockResets(j, ast) {
     .find(j.CallExpression, {
       callee: {
         type: 'MemberExpression',
+        object: {
+          type: 'Identifier',
+          name: (name) => name !== 'sandbox',
+        },
         property: {
           type: 'Identifier',
-          name: (name) => name in SINON_MOCK_RESETS,
+          // FIXED: 'name in SINON_MOCK_RESETS' matched if `name === 'toString'`
+          name: (name) => Object.hasOwn(SINON_MOCK_RESETS, name),
         },
       },
     })
@@ -496,7 +603,7 @@ function transformMockResets(j, ast) {
   // .any. matches:
   sinon.match.[any|number|string|object|func|array] -> expect.any(type)
 */
-function transformMatch(j, ast) {
+function transformMatch(j: core.JSCodeshift, ast) {
   ast
     .find(j.CallExpression, {
       callee: {
@@ -538,6 +645,35 @@ function transformMatch(j, ast) {
       }
       return j.callExpression(j.identifier('expect.anything'), [])
     })
+
+  let whenRequired = false
+  // match.any
+  ast
+    .find(j.MemberExpression, {
+      object: {
+        type: 'Identifier',
+        name: 'match',
+      },
+      property: {
+        type: 'Identifier',
+        name: 'any',
+      },
+    })
+    .replaceWith((node) => {
+      whenRequired = true
+      return j.callExpression(j.identifier('when'), [
+        j.arrowFunctionExpression([], j.literal(true)),
+      ])
+    })
+
+  if (whenRequired) {
+    const importStatement = j.importDeclaration(
+      [j.importSpecifier(j.identifier('when'))],
+      j.literal('jest-when')
+    )
+
+    ast.find(j.Program).get('body', 0).insertBefore(importStatement)
+  }
 }
 
 function transformMockTimers(j, ast) {
@@ -636,12 +772,112 @@ function transformMockTimers(j, ast) {
     })
 }
 
+/**
+ * to.be.true -> to.eq(true)
+ */
+function transformBeBoolean(j: core.JSCodeshift, ast: Collection<any>) {
+  ast
+    .find(j.MemberExpression, {
+      property: {
+        type: 'Identifier',
+        name: (name) => ['true', 'false'].includes(name),
+      },
+      object: {
+        type: 'MemberExpression',
+        property: {
+          type: 'Identifier',
+          name: 'be',
+        },
+      },
+    })
+    .replaceWith((path) => {
+      const callee = j(path.node.object).nodes()[0]
+      // d@ts-expect-error - property.name is there
+      callee.property.name = 'eq'
+      const ret = j.callExpression(callee, [
+        // @ts-expect-error - property.name is there
+        j.literal(path.node.property.name === 'true'),
+      ])
+      // console.log(`${debug(path.node)} --> ${debug(ret)}`)
+      return ret
+    })
+}
+
+function findSinonImport(j: core.JSCodeshift, ast: Collection<any>) {
+  const sinonImports: Collection<core.ImportDeclaration> = findImports(j, ast, 'sinon')
+  if (sinonImports.length === 0) return null
+
+  return sinonImports.paths()[0]
+}
+function findSinonImportName(path: core.ASTPath<core.ImportDeclaration>) {
+  return path.node.specifiers.find((s) => s.type === 'ImportDefaultSpecifier')?.local.name
+}
+
+const SANDBOX_FN_MAP = {
+  spy: 'fn',
+  mock: 'stubAll',
+  restore: 'dispose',
+}
+
+function old_transformSandbox(j, ast) {
+  let foundSandbox = false
+  const sandboxNode = ast
+    .find(j.MemberExpression, {
+      object: {
+        type: 'Identifier',
+        name: 'sinon',
+      },
+      property: {
+        type: 'Identifier',
+        name: 'createSandbox',
+      },
+    })
+    .replaceWith((node) => {
+      foundSandbox = true
+      return j.identifier('createSandbox')
+    })
+
+  if (!foundSandbox) return
+
+  if (!sandboxNode) return
+  const sandboxDeclaration = sandboxNode.closest(j.VariableDeclarator).paths()[0]
+  if (!sandboxDeclaration) return
+  const sandboxIdentifier =
+    sandboxDeclaration.node.id.type === 'Identifier' && sandboxDeclaration.node.id.name
+  if (!sandboxIdentifier) return
+
+  // Add `import createSandbox from 'bolt/tests/utils/sandbox'`
+  const importStatement = j.importDeclaration(
+    [j.importSpecifier(j.identifier('createSandbox'))],
+    j.literal('bolt/tests/utils/sandbox')
+  )
+  ast.find(j.Program).get('body', 0).insertBefore(importStatement)
+
+  ast
+    .find(j.MemberExpression, {
+      object: {
+        type: 'Identifier',
+        name: sandboxIdentifier,
+      },
+      property: {
+        type: 'Identifier',
+        name: (name) => Object.hasOwn(SANDBOX_FN_MAP, name),
+      },
+    })
+    .replaceWith((path) => {
+      const propertyName = (path.node.property as core.Identifier).name
+      return j.memberExpression(
+        path.node.object,
+        j.identifier(SANDBOX_FN_MAP[propertyName])
+      )
+    })
+}
+
 export default function transformer(fileInfo: FileInfo, api: API, options) {
   const j = api.jscodeshift
   const ast = j(fileInfo.source)
 
-  const sinonExpression = removeDefaultImport(j, ast, 'sinon')
-
+  const sinonExpression = findSinonImport(j, ast)
   if (!sinonExpression) {
     // console.warn(`no sinon for "${fileInfo.path}"`)
     if (!options.skipImportDetection) {
@@ -650,14 +886,32 @@ export default function transformer(fileInfo: FileInfo, api: API, options) {
     return null
   }
 
-  transformStub(j, ast, sinonExpression)
+  transformBeBoolean(j, ast)
+
+  transformSandbox(j, ast)
+
+  transformStub(j, ast, findSinonImportName(sinonExpression))
+  transformResolves(j, ast)
   transformMockTimers(j, ast)
   transformMock(j, ast)
   transformMockResets(j, ast)
+  transformAssertCalled(j, ast)
   transformCallCountAssertions(j, ast)
   transformCalledWithAssertions(j, ast)
   transformMatch(j, ast)
   transformStubGetCalls(j, ast)
+
+  // Remove the sinon import
+  ast
+    .find(j.ImportDeclaration, {
+      source: {
+        type: 'StringLiteral',
+        value: 'sinon',
+      },
+    })
+    .forEach((p) => {
+      p.prune()
+    })
 
   return finale(fileInfo, j, ast, options)
 }
