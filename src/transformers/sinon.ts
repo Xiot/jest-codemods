@@ -275,6 +275,23 @@ function transformStub(j: core.JSCodeshift, ast, sinonName: string) {
   // console.log('exp', sinonExpression.get('name')
 
   if (!sinonName) return
+
+  // sinon.fake -> jest.fn
+  ast
+    .find(j.MemberExpression, {
+      property: {
+        type: 'Identifier',
+        name: 'fake',
+      },
+      object: {
+        type: 'Identifier',
+        name: sinonName,
+      },
+    })
+    .replaceWith((p) => {
+      return j.memberExpression(j.identifier('jest'), j.identifier('fn'))
+    })
+
   ast
     .find(j.CallExpression, {
       callee: {
