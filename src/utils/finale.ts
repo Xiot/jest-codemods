@@ -56,7 +56,7 @@ function updateJestImports(j, ast, isStandaloneMode, testFunctionName = 'jest') 
 export default function finale(
   fileInfo,
   j: jscodeshift.JSCodeshift,
-  ast: any,
+  ast: jscodeshift.Collection<any>,
   transformerOptions,
   testFunctionName?: string
 ) {
@@ -70,5 +70,5 @@ export default function finale(
   // and default to something sane.
   const quote = detectQuoteStyle(j, ast) || 'single'
   const lineTerminator = detectLineTerminator(fileInfo.source)
-  return ast.toSource({ quote, lineTerminator })
+  return ast.toSource({ quote, lineTerminator, wrapColumn: 120 })
 }

@@ -230,11 +230,6 @@ function transformObjectStubs(ctx: IContext, id: ASTPath<Identifier>) {
     })
 }
 
-function getUsages(ctx: IContext, id: ASTPath<Identifier>) {
-  const b = id.scope.getBindings()
-  console.log(debug(id.scope.path))
-}
-
 export function transformSandbox(j: core.JSCodeshift, ast: Collection<any>) {
   const ctx = getContext(j, ast)
   if (!ctx) {
